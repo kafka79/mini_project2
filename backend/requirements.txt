@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+indic-nlp-library
+python-Levenshtein
+fuzzywuzzy
+python-multipart

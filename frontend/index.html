@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Indic Phonetic Similarity Detector</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&family=Outfit:wght@400;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="background-blobs">
+        <div class="blob blob-1"></div>
+        <div class="blob blob-2"></div>
+        <div class="blob blob-3"></div>
+    </div>
+
+    <main class="container">
+        <header>
+            <h1>Phonetic<span>Similarity</span></h1>
+            <p>Advanced detection for Indian Names & Place Entities</p>
+        </header>
+
+        <section class="card glass">
+            <div class="input-group">
+                <div class="input-field">
+                    <label for="name1">First Name / Place</label>
+                    <input type="text" id="name1" placeholder="e.g. Sanjay" autocomplete="off">
+                </div>
+                <div class="input-field">
+                    <label for="name2">Second Name / Place</label>
+                    <input type="text" id="name2" placeholder="e.g. Sunjay" autocomplete="off">
+                </div>
+            </div>
+            
+            <button id="compare-btn" class="btn-primary">
+                Detect Similarity
+                <span class="btn-icon">→</span>
+            </button>
+        </section>
+
+        <section id="result-section" class="result-container hidden">
+            <div class="score-card glass">
+                <div class="score-circle">
+                    <svg viewBox="0 0 36 36" class="circular-chart">
+                        <path class="circle-bg" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" />
+                        <path id="score-path" class="circle" stroke-dasharray="0, 100" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" />
+                    </svg>
+                    <div class="score-text">
+                        <span id="score-value">0</span>
+                        <small>% Match</small>
+                    </div>
+                </div>
+                <div class="status-badge" id="similarity-status">Highly Similar</div>
+            </div>
+
+            <div class="details-grid">
+                <div class="detail-item glass">
+                    <span class="label">Phonetic Code 1</span>
+                    <span class="value" id="code1">-</span>
+                </div>
+                <div class="detail-item glass">
+                    <span class="label">Phonetic Code 2</span>
+                    <span class="value" id="code2">-</span>
+                </div>
+            </div>
+        </section>
+
+        <section class="samples">
+            <h3>Try these examples:</h3>
+            <div class="sample-chips">
+                <button class="chip" data-n1="Varanasi" data-n2="Benares">Varanasi vs Benares</button>
+                <button class="chip" data-n1="Amit" data-n2="Ameet">Amit vs Ameet</button>
+                <button class="chip" data-n1="Kolkata" data-n2="Calcutta">Kolkata vs Calcutta</button>
+                <button class="chip" data-n1="Thiruvananthapuram" data-n2="Trivandrum">Trivandrum variants</button>
+            </div>
+        </section>
+    </main>
+
+    <script src="main.js"></script>
+</body>
+</html>
