@@ -14,7 +14,7 @@ class IndicPhoneticEngine:
             'C': 'K', 'G': 'K', 'K': 'K', 'Q': 'K',
             'D': 'T', 'T': 'T',
             'L': 'L',
-            'M': 'M', 'N': 'M',
+            'M': 'M', 'N': 'N',            # ponytail: separate M and N to avoid false-positive collisions
             'R': 'R',
             'S': 'S', 'Z': 'S', 'X': 'S',
             'J': 'J', 'H': 'H',             # ponytail: Map H to H to preserve standalone/aspirated sounds
@@ -23,7 +23,7 @@ class IndicPhoneticEngine:
         # Indic spelling substitution rules applied before mapping
         # ponytail: Precompiled regex patterns avoid compile-on-the-fly execution overhead
         self.indic_rules = [
-            (re.compile(r'CH|KSH|SH|S'), 'S'),
+            (re.compile(r'CH|KSH|KSS|KS|SH|S|X'), 'S'),
             (re.compile(r'PH|F'), 'P'),
             (re.compile(r'BH'), 'BH'),
             (re.compile(r'B'), 'B'),
@@ -44,7 +44,12 @@ class IndicPhoneticEngine:
             import os
             aliases_path = os.path.join(os.path.dirname(__file__), "aliases.json")
             with open(aliases_path, "r", encoding="utf-8") as f:
-                self.aliases = {k: set(v) for k, v in json.load(f).items()}
+                # ponytail: clean and normalize config on load to avoid case/space/diacritic mismatches
+                self.aliases = {}
+                for k, v in json.load(f).items():
+                    k_norm = self.normalize(k).lower()
+                    if k_norm:
+                        self.aliases[k_norm] = {self.normalize(x).lower() for x in v if self.normalize(x).strip()}
         except Exception:
             self.aliases = {}
 
@@ -52,15 +57,28 @@ class IndicPhoneticEngine:
         """Convert Indic/Brahmi scripts to Latin phonetic characters using unicode names."""
         # ponytail: first-principles transliteration using standard library unicode names
         result = []
-        for char in text:
+        chars = list(text)
+        for i, char in enumerate(chars):
             try:
                 name = unicodedata.name(char)
                 if any(script in name for script in ["DEVANAGARI", "BENGALI", "GURMUKHI", "GUJARATI", "ORIYA", "TAMIL", "TELUGU", "KANNADA", "MALAYALAM"]):
+                    if "VIRAMA" in name or "HALANT" in name:
+                        continue
                     parts = name.split()
                     if len(parts) >= 3:
                         sound = parts[-1].lower()
-                        if sound.endswith('a') and len(sound) > 1 and parts[-2] == "LETTER":
-                            sound = sound[:-1]
+                        # ponytail: check if this is a letter and if the next char suppresses its inherent vowel
+                        if parts[-2] == "LETTER" and sound.endswith('a') and len(sound) > 1:
+                            next_suppresses = True
+                            if i + 1 < len(chars):
+                                try:
+                                    next_name = unicodedata.name(chars[i+1])
+                                    if "LETTER" in next_name:
+                                        next_suppresses = False
+                                except ValueError:
+                                    pass
+                            if next_suppresses:
+                                sound = sound[:-1]
                         result.append(sound)
                 else:
                     result.append(char)
@@ -81,8 +99,9 @@ class IndicPhoneticEngine:
             c for c in unicodedata.normalize('NFD', text)
             if unicodedata.category(c) != 'Mn'
         )
-        # Replace non-alphabetic/non-space characters with a space to preserve word boundaries (e.g. Sanjay-Kumar -> Sanjay Kumar)
-        text = re.sub(r'[^A-Z\s]', ' ', text)
+        # Replace non-alphabetic/non-numeric/non-space characters with space
+        # ponytail: preserve numbers (0-9) to avoid colliding "Sector 2" vs "Sector 3"
+        text = re.sub(r'[^A-Z0-9\s]', ' ', text)
         # Collapse multiple spaces
         text = re.sub(r'\s+', ' ', text)
         return text.strip()
@@ -118,14 +137,15 @@ class IndicPhoneticEngine:
 
     def compare(self, name1, name2, enable_aliases=True):
         """Compares two names and returns a similarity score (0-100)."""
-        clean1 = name1.strip().lower()
-        clean2 = name2.strip().lower()
-        
-        if not clean1 or not clean2:
+        if not name1.strip() or not name2.strip():
             raise ValueError("Input names cannot be empty")
+
+        # ponytail: compute normalized lowercased names first to handle diacritics/spacing uniformly
+        norm1 = self.normalize(name1).lower()
+        norm2 = self.normalize(name2).lower()
             
         # 1. Exact Match Check
-        if clean1 == clean2:
+        if norm1 == norm2:
             return {
                 "name1": name1,
                 "name2": name2,
@@ -137,7 +157,7 @@ class IndicPhoneticEngine:
             }
 
         # 2. Alias Synonym Check
-        if enable_aliases and clean1 in self.aliases and clean2 in self.aliases[clean1]:
+        if enable_aliases and norm1 in self.aliases and norm2 in self.aliases[norm1]:
             return {
                 "name1": name1,
                 "name2": name2,
@@ -152,13 +172,13 @@ class IndicPhoneticEngine:
         code1 = self.get_phonetic_code(name1)
         code2 = self.get_phonetic_code(name2)
         
-        fuzzy_score = fuzz.token_sort_ratio(clean1, clean2)
+        fuzzy_score = fuzz.token_sort_ratio(norm1, norm2)
         
         # 4. Hybrid Scoring Logic
         # ponytail: simple linear boost/penalty. Machine learning weights if data-driven calibration is needed.
         if code1 and code2 and code1 == code2:
-            final_score = min(100.0, fuzzy_score + (25.0 if min(len(clean1), len(clean2)) > 3 else 15.0))
-            final_score = max(final_score, 75.0 if min(len(clean1), len(clean2)) > 3 else 40.0)
+            final_score = min(100.0, fuzzy_score + (25.0 if min(len(norm1), len(norm2)) > 3 else 15.0))
+            final_score = max(final_score, 75.0 if min(len(norm1), len(norm2)) > 3 else 40.0)
         else:
             final_score = fuzzy_score * 0.70
             

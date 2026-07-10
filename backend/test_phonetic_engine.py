@@ -73,3 +73,33 @@ def test_transliterate_indic(engine):
     # Test normalization and similarity of native script vs transliterated script
     result = engine.compare("अमित", "Ameet")
     assert result["is_similar"] is True
+
+def test_mn_separation(engine):
+    # ponytail: Sam and San should not collide on SAM code, they should have distinct codes and not match highly
+    code_sam = engine.get_phonetic_code("Sam")
+    code_san = engine.get_phonetic_code("San")
+    assert code_sam != code_san
+    
+    result = engine.compare("Sam", "San")
+    assert result["is_similar"] is False
+
+def test_conjunct_transliteration(engine):
+    # ponytail: Sanskrit conjunct transliteration should skip virama and not contain literal "virama" string
+    trans = engine.transliterate_indic("लक्ष्मी")
+    assert "virama" not in trans
+    assert "halant" not in trans
+    
+    result = engine.compare("लक्ष्मी", "Lakshmi")
+    assert result["is_similar"] is True
+
+def test_numerical_entities(engine):
+    # ponytail: Sector 2 and Sector 3 should have different codes and not match highly
+    result = engine.compare("Sector 2", "Sector 3")
+    assert result["is_similar"] is False
+    assert result["score"] < 100.0
+
+def test_accented_aliases(engine):
+    # ponytail: Varanasi alias check should work even with accents/diacritics in input
+    result = engine.compare("Varanasī", "Benares")
+    assert result["match_type"] == "alias"
+    assert result["score"] == 100.0
