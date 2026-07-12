@@ -36,8 +36,20 @@ class SlidingWindowRateLimiter:
         now = time.time()
         with self.lock:
             # Keep only requests within the current sliding window
-            self.requests[client_ip] = [t for t in self.requests[client_ip] if now - t < self.window]
-            if len(self.requests[client_ip]) < self.limit:
+            times = [t for t in self.requests[client_ip] if now - t < self.window]
+            if times:
+                self.requests[client_ip] = times
+            else:
+                self.requests.pop(client_ip, None)
+                times = []
+                
+            # Periodically prune old/inactive client IPs to avoid memory leaks
+            if len(self.requests) > 1000:
+                expired_ips = [ip for ip, req_times in list(self.requests.items()) if not req_times or now - req_times[-1] >= self.window]
+                for ip in expired_ips:
+                    self.requests.pop(ip, None)
+                    
+            if len(times) < self.limit:
                 self.requests[client_ip].append(now)
                 return True
             return False
@@ -207,7 +219,8 @@ async def compare_names(request: ComparisonRequest):
     
     start_time = time.perf_counter()
     try:
-        result = engine.compare(
+        result = await run_in_threadpool(
+            engine.compare,
             request.name1,
             request.name2,
             request.enable_aliases,
@@ -222,26 +235,29 @@ async def compare_names(request: ComparisonRequest):
         logger.error(f"Error during comparison: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error during processing")
 
-def process_batch_sync(pairs: List[ComparisonRequest], global_enable_aliases: bool, global_threshold: float):
-    """Processes batch sequentially inside a worker thread to prevent event loop blocking."""
-    results = []
-    for i, pair in enumerate(pairs):
-        try:
-            # Validate input values (sanitized)
-            validate_input(pair.name1, f"Pair {i+1} Name 1")
-            validate_input(pair.name2, f"Pair {i+1} Name 2")
-            
-            # Determine threshold & alias enablement preference
-            aliases_flag = pair.enable_aliases if pair.enable_aliases is not None else global_enable_aliases
-            threshold_val = pair.threshold if pair.threshold is not None else global_threshold
-            
-            res = engine.compare(pair.name1, pair.name2, aliases_flag, threshold_val)
-            results.append({"status": "success", "data": res})
-        except HTTPException as e:
-            results.append({"status": "error", "error": e.detail})
-        except Exception as e:
-            results.append({"status": "error", "error": f"Internal error during batch processing"})
-    return results
+async def process_pair(pair: ComparisonRequest, global_enable_aliases: bool, global_threshold: float, index: int):
+    """Worker helper to validate and run comparisons in a threadpool concurrently."""
+    try:
+        # Validate input values (sanitized)
+        validate_input(pair.name1, f"Pair {index+1} Name 1")
+        validate_input(pair.name2, f"Pair {index+1} Name 2")
+        
+        # Determine threshold & alias enablement preference
+        aliases_flag = pair.enable_aliases if pair.enable_aliases is not None else global_enable_aliases
+        threshold_val = pair.threshold if pair.threshold is not None else global_threshold
+        
+        res = await run_in_threadpool(
+            engine.compare,
+            pair.name1,
+            pair.name2,
+            aliases_flag,
+            threshold_val
+        )
+        return {"status": "success", "data": res}
+    except HTTPException as e:
+        return {"status": "error", "error": e.detail}
+    except Exception as e:
+        return {"status": "error", "error": "Internal error during batch processing"}
 
 @app.post("/compare-batch", dependencies=[Depends(rate_limit_dependency)])
 async def compare_batch(request: BatchRequest):
@@ -250,16 +266,15 @@ async def compare_batch(request: BatchRequest):
 
     start_time = time.perf_counter()
     
-    # Offload CPU-bound batch computation loop to prevent event loop blockages
-    results = await run_in_threadpool(
-        process_batch_sync,
-        request.pairs,
-        request.enable_aliases,
-        request.threshold
-    )
+    # Offload CPU-bound batch computation tasks concurrently to avoid blocking
+    tasks = [
+        process_pair(pair, request.enable_aliases, request.threshold, i)
+        for i, pair in enumerate(request.pairs)
+    ]
+    results = await asyncio.gather(*tasks)
     
     duration_ms = (time.perf_counter() - start_time) * 1000
-    logger.info(f"Batch of {len(request.pairs)} comparisons completed in {duration_ms:.2f}ms")
+    logger.info(f"Batch of {len(request.pairs)} comparisons completed concurrently in {duration_ms:.2f}ms")
     return {
         "results": results,
         "processing_time_ms": round(duration_ms, 3)

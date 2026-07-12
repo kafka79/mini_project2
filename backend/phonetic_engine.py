@@ -5,6 +5,7 @@ from rapidfuzz import fuzz
 class IndicPhoneticEngine:
     # --- Empirical Scoring Weights & Thresholds ---
     # These parameters calibrate phonetic vs fuzzy similarity balance.
+    # We define class level defaults which can be overridden dynamically per instance.
     DEFAULT_THRESHOLD = 75.0  # Match confidence >= 75 indicates highly similar names
     MAX_CODE_LEN = 6         # Truncation limit for individual word phonetic codes
     
@@ -16,6 +17,15 @@ class IndicPhoneticEngine:
     MIN_LONG_WORD = 75.0      # Minimum score floor for long words with phonetic match
 
     def __init__(self):
+        # Dynamic instances parameters (overridable via admin API)
+        self.DEFAULT_THRESHOLD = IndicPhoneticEngine.DEFAULT_THRESHOLD
+        self.MAX_CODE_LEN = IndicPhoneticEngine.MAX_CODE_LEN
+        self.FUZZY_WEIGHT = IndicPhoneticEngine.FUZZY_WEIGHT
+        self.BOOST_SHORT_WORD = IndicPhoneticEngine.BOOST_SHORT_WORD
+        self.BOOST_LONG_WORD = IndicPhoneticEngine.BOOST_LONG_WORD
+        self.MIN_SHORT_WORD = IndicPhoneticEngine.MIN_SHORT_WORD
+        self.MIN_LONG_WORD = IndicPhoneticEngine.MIN_LONG_WORD
+
         # Phonetic mapping for Indic names (transliterated to Latin)
         # Maps similar sounding letters to common representative characters.
         # Front vowels (E, I, Y) are separated from back vowels (O, U) to avoid Amit vs Umit collision.
@@ -50,6 +60,12 @@ class IndicPhoneticEngine:
         
         # Load aliases on initialization
         self.reload_aliases()
+
+    def update_weights(self, weights_dict):
+        """Updates internal empirical weights dynamically."""
+        for k, v in weights_dict.items():
+            if hasattr(self, k):
+                setattr(self, k, v)
 
     def reload_aliases(self, path=None):
         """Loads and expands aliases from aliases.json to build a bidirectional, transitive synonym index."""
@@ -114,28 +130,39 @@ class IndicPhoneticEngine:
                     if "VIRAMA" in name or "HALANT" in name:
                         continue
                     parts = name.split()
-                    if len(parts) >= 3:
+                    
+                    # Robust phonetic part extraction
+                    if "LETTER" in parts:
+                        idx = parts.index("LETTER")
+                        sound = "".join(parts[idx+1:]).lower()
+                    elif "SIGN" in parts:
+                        idx = parts.index("SIGN")
+                        sound = "".join(parts[idx+1:]).lower()
+                    elif len(parts) >= 3:
                         sound = parts[-1].lower()
-                        # Consonant letters usually end with inherent 'a' schwa sound
-                        if parts[-2] == "LETTER" and sound.endswith('a') and len(sound) > 1:
-                            # Apply schwa deletion (suppress inherent 'a') at word boundaries or if followed by dependent vowel sign / virama
-                            suppress = False
-                            if i + 1 >= len(chars):
-                                suppress = True  # End of word / string
-                            else:
-                                try:
-                                    next_char = chars[i+1]
-                                    next_name = unicodedata.name(next_char)
-                                    if "VOWEL SIGN" in next_name or "VIRAMA" in next_name or "HALANT" in next_name:
-                                        suppress = True
-                                    elif not next_char.isalnum():
-                                        suppress = True  # Spacing/punctuation indicates word boundary
-                                except ValueError:
+                    else:
+                        sound = char.lower()
+                    
+                    # Consonant letters usually end with inherent 'a' schwa sound
+                    if "LETTER" in parts and sound.endswith('a') and len(sound) > 1:
+                        # Apply schwa deletion (suppress inherent 'a') at word boundaries or if followed by dependent vowel sign / virama
+                        suppress = False
+                        if i + 1 >= len(chars):
+                            suppress = True  # End of word / string
+                        else:
+                            try:
+                                next_char = chars[i+1]
+                                next_name = unicodedata.name(next_char)
+                                if "VOWEL SIGN" in next_name or "VIRAMA" in next_name or "HALANT" in next_name:
                                     suppress = True
-                            
-                            if suppress:
-                                sound = sound[:-1]
-                        result.append(sound)
+                                elif not next_char.isalnum():
+                                    suppress = True  # Spacing/punctuation indicates word boundary
+                            except ValueError:
+                                suppress = True
+                        
+                        if suppress:
+                            sound = sound[:-1]
+                    result.append(sound)
                 else:
                     result.append(char)
             except ValueError:
