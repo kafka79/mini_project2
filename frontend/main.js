@@ -63,10 +63,16 @@ document.addEventListener('DOMContentLoaded', () => {
     function showToast(message, type = 'error') {
         const toast = document.createElement('div');
         toast.className = `toast toast-${type}`;
-        toast.innerHTML = `
-            <span class="toast-message">${message}</span>
-            <button class="toast-close">&times;</button>
-        `;
+        const messageSpan = document.createElement('span');
+        messageSpan.className = 'toast-message';
+        messageSpan.textContent = message;
+
+        const closeBtn = document.createElement('button');
+        closeBtn.className = 'toast-close';
+        closeBtn.innerHTML = '&times;';
+
+        toast.appendChild(messageSpan);
+        toast.appendChild(closeBtn);
         toastContainer.appendChild(toast);
 
         // Slide/Fade in
@@ -188,10 +194,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // 1. Reset semantic match classes on circular path using design system rules
         scorePath.classList.remove('stroke-high', 'stroke-med', 'stroke-low');
-        if (targetScore >= 90) {
-            scorePath.classList.add('stroke-high');
-        } else if (targetScore >= customThreshold) {
-            scorePath.classList.add('stroke-med');
+        if (targetScore >= customThreshold) {
+            if (targetScore >= 90) {
+                scorePath.classList.add('stroke-high');
+            } else {
+                scorePath.classList.add('stroke-med');
+            }
         } else {
             scorePath.classList.add('stroke-low');
         }
@@ -221,12 +229,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // 2. Reset semantic badge styles using CSS Classes
         similarityStatus.classList.remove('status-high', 'status-med', 'status-low');
-        if (data.score >= 90) {
-            similarityStatus.textContent = data.match_type === 'alias' ? 'Verified Alias' : 'Highly Similar';
-            similarityStatus.classList.add('status-high');
-        } else if (data.score >= customThreshold) {
-            similarityStatus.textContent = 'Likely Match';
-            similarityStatus.classList.add('status-med');
+        if (data.score >= customThreshold) {
+            if (data.score >= 90) {
+                similarityStatus.textContent = data.match_type === 'alias' ? 'Verified Alias' : 'Highly Similar';
+                similarityStatus.classList.add('status-high');
+            } else {
+                similarityStatus.textContent = 'Likely Match';
+                similarityStatus.classList.add('status-med');
+            }
         } else {
             similarityStatus.textContent = 'Distinct Entities';
             similarityStatus.classList.add('status-low');

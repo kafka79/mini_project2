@@ -54,6 +54,16 @@ def test_vowel_compression_differentiation(engine):
     assert result["is_similar"] is False
     assert result["score"] < 75.0
 
+def test_soft_phonetic_match_vowel_shift(engine):
+    # Sanjay vs Sunjay should be highly similar despite vowel shift (SANJAI vs SUNJAI)
+    code1 = engine.get_phonetic_code("Sanjay")
+    code2 = engine.get_phonetic_code("Sunjay")
+    assert code1 != code2
+    
+    result = engine.compare("Sanjay", "Sunjay")
+    assert result["is_similar"] is True
+    assert result["score"] >= 75.0
+
 def test_space_preservation_multi_word(engine):
     # Standard name with multiple words
     code = engine.get_phonetic_code("Sanjay Kumar")
@@ -116,4 +126,15 @@ def test_custom_threshold(engine):
     # If we pass a lower threshold (50), it should be evaluated as similar.
     res_low = engine.compare("Amit", "Umit", threshold=50.0)
     assert res_low["is_similar"] is True
+
+def test_schwa_deletion_normalization(engine):
+    # Schwa deletion checks: Amit vs Amita should map identically
+    result = engine.compare("Amit", "Amita")
+    assert result["is_similar"] is True
+    assert result["score"] == 100.0  # Exact match due to terminal 'a' deletion
+    assert result["match_type"] == "exact"
+
+    result_vowel = engine.compare("Suneeta", "Sunita")
+    assert result_vowel["is_similar"] is True
+    assert result_vowel["score"] >= 95.0
 

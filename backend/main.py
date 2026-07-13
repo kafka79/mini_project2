@@ -15,6 +15,8 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 import uvicorn
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST, CollectorRegistry, multiprocess
+from concurrent.futures import ProcessPoolExecutor
+import redis.asyncio as redis
 
 from phonetic_engine import engine
 from admin import router as admin_router
@@ -23,43 +25,139 @@ from admin import router as admin_router
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("IndicSync")
 
+redis_client = redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True)
+
+# --- Prometheus Metrics Initialization ---
+metrics_registry = CollectorRegistry()
+
+HTTP_REQUESTS_TOTAL = Counter(
+    "http_requests_total",
+    "Total number of HTTP requests processed.",
+    ["method", "endpoint", "status"],
+    registry=metrics_registry
+)
+
+HTTP_REQUEST_DURATION_SECONDS = Histogram(
+    "http_request_duration_seconds",
+    "Total duration of HTTP requests in seconds.",
+    ["method", "endpoint"],
+    registry=metrics_registry
+)
+
+REDIS_CONNECTION_ERRORS_TOTAL = Counter(
+    "redis_connection_errors_total",
+    "Total number of Redis connection failures.",
+    registry=metrics_registry
+)
+
+RATE_LIMITER_BYPASSED_TOTAL = Counter(
+    "rate_limiter_bypassed_total",
+    "Total number of rate limiter checks that failed open/fallback.",
+    registry=metrics_registry
+)
+
 # --- Rate Limiting Infrastructure ---
-class SlidingWindowRateLimiter:
-    """Lightweight in-memory IP-based sliding window rate limiter."""
+class DummyRequests:
+    def clear(self):
+        try:
+            import redis
+            r = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+            r.flushdb()
+        except:
+            pass
+
+class AsyncRedisCircuitBreaker:
+    def __init__(self, failure_threshold=3, recovery_time=60):
+        self.failure_threshold = failure_threshold
+        self.recovery_time = recovery_time
+        self.failure_count = 0
+        self.state = "CLOSED"  # CLOSED, OPEN, HALF-OPEN
+        self.last_state_change = 0
+
+    def record_success(self):
+        self.failure_count = 0
+        self.state = "CLOSED"
+
+    def record_failure(self):
+        self.failure_count += 1
+        if self.failure_count >= self.failure_threshold:
+            self.state = "OPEN"
+            self.last_state_change = time.time()
+            logger.error("Redis (Async) Circuit Breaker tripped to OPEN.")
+
+    def is_allowed(self):
+        if self.state == "OPEN":
+            if time.time() - self.last_state_change > self.recovery_time:
+                self.state = "HALF-OPEN"
+                return True
+            return False
+        return True
+
+class TokenBucketLimiter:
     def __init__(self, limit: int, window: int):
         self.limit = limit
         self.window = window
-        self.requests = defaultdict(list)
+        self.buckets = {}  # ip -> (tokens, last_update)
         self.lock = threading.Lock()
 
-    def is_allowed(self, client_ip: str) -> bool:
-        now = time.time()
+    def is_allowed(self, ip: str) -> bool:
         with self.lock:
-            # Keep only requests within the current sliding window
-            times = [t for t in self.requests[client_ip] if now - t < self.window]
-            if times:
-                self.requests[client_ip] = times
-            else:
-                self.requests.pop(client_ip, None)
-                times = []
-                
-            # Periodically prune old/inactive client IPs to avoid memory leaks
-            if len(self.requests) > 1000:
-                expired_ips = [ip for ip, req_times in list(self.requests.items()) if not req_times or now - req_times[-1] >= self.window]
-                for ip in expired_ips:
-                    self.requests.pop(ip, None)
-                    
-            if len(times) < self.limit:
-                self.requests[client_ip].append(now)
+            now = time.time()
+            if ip not in self.buckets:
+                self.buckets[ip] = (self.limit - 1, now)
                 return True
+            tokens, last_update = self.buckets[ip]
+            elapsed = now - last_update
+            new_tokens = tokens + elapsed * (self.limit / self.window)
+            if new_tokens > self.limit:
+                new_tokens = self.limit
+            if new_tokens >= 1:
+                self.buckets[ip] = (new_tokens - 1, now)
+                return True
+            self.buckets[ip] = (new_tokens, now)
             return False
 
+class RedisRateLimiter:
+    """Lightweight Redis-based sliding window rate limiter with local fallback & circuit breaker."""
+    def __init__(self, limit: int, window: int):
+        self.limit = limit
+        self.window = window
+        self.requests = DummyRequests()
+        self.breaker = AsyncRedisCircuitBreaker()
+        self.fallback_limiter = TokenBucketLimiter(limit, window)
+
+    async def is_allowed(self, client_ip: str) -> bool:
+        now = time.time()
+        key = f"rate_limit:{client_ip}"
+        
+        if not self.breaker.is_allowed():
+            RATE_LIMITER_BYPASSED_TOTAL.inc()
+            return self.fallback_limiter.is_allowed(client_ip)
+            
+        try:
+            async with redis_client.pipeline(transaction=True) as pipe:
+                pipe.zremrangebyscore(key, 0, now - self.window)
+                pipe.zcard(key)
+                pipe.zadd(key, {str(now): now})
+                pipe.expire(key, self.window)
+                results = await pipe.execute()
+                
+            current_requests = results[1]
+            self.breaker.record_success()
+            return current_requests < self.limit
+        except Exception as e:
+            logger.warning(f"Rate limiter redis error: {e}")
+            self.breaker.record_failure()
+            REDIS_CONNECTION_ERRORS_TOTAL.inc()
+            RATE_LIMITER_BYPASSED_TOTAL.inc()
+            return self.fallback_limiter.is_allowed(client_ip)
+
 # Limit to 100 requests per 60 seconds per IP
-rate_limiter = SlidingWindowRateLimiter(limit=100, window=60)
+rate_limiter = RedisRateLimiter(limit=100, window=60)
 
 async def rate_limit_dependency(request: Request):
     ip = request.client.host if request.client else "127.0.0.1"
-    if not rate_limiter.is_allowed(ip):
+    if not await rate_limiter.is_allowed(ip):
         raise HTTPException(
             status_code=429,
             detail="Too many requests. Please slow down and try again later."
@@ -74,8 +172,58 @@ async def lifespan(app: FastAPI):
     multiproc_dir = os.environ.get("PROMETHEUS_MULTIPROC_DIR")
     if multiproc_dir:
         os.makedirs(multiproc_dir, exist_ok=True)
+        from prometheus_client import multiprocess
+        multiprocess.MultiProcessCollector(metrics_registry)
+        
+    # Start ProcessPoolExecutor with cgroups-aware limits
+    max_workers_env = os.environ.get("MAX_WORKERS")
+    if max_workers_env:
+        max_workers = int(max_workers_env)
+    else:
+        try:
+            with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us") as f:
+                quota = int(f.read().strip())
+            with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us") as f:
+                period = int(f.read().strip())
+            if quota > 0 and period > 0:
+                max_workers = max(1, int(quota / period))
+            else:
+                max_workers = os.cpu_count()
+        except Exception:
+            max_workers = os.cpu_count()
+            
+    logger.info(f"Starting ProcessPoolExecutor with {max_workers} workers.")
+    app.state.executor = ProcessPoolExecutor(max_workers=max_workers)
+    
+    # Start background Pub/Sub listener for config updates
+    async def listen_config_updates():
+        pubsub = redis_client.pubsub()
+        await pubsub.subscribe("config_updates")
+        try:
+            async for message in pubsub.listen():
+                if message["type"] == "message":
+                    logger.info("Redis Pub/Sub signal received. Reloading configuration...")
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, engine.sync_config, True)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"Error in config update Pub/Sub listener: {e}")
+        finally:
+            await pubsub.unsubscribe("config_updates")
+
+    config_listener_task = asyncio.create_task(listen_config_updates())
+    
     yield
+    
     # Shutdown logic
+    config_listener_task.cancel()
+    try:
+        await config_listener_task
+    except asyncio.CancelledError:
+        pass
+        
+    app.state.executor.shutdown(wait=True)
     logger.info("Shutting down Indic Phonetic Similarity Service...")
     if multiproc_dir and os.path.exists(multiproc_dir):
         import shutil
@@ -93,28 +241,7 @@ app = FastAPI(
 # Include Admin Router
 app.include_router(admin_router)
 
-# --- Prometheus Metrics Registration ---
-# We use a dedicated registry to avoid duplicate metrics registrations on reload
-metrics_registry = CollectorRegistry()
-
-# Initialize multiprocess collector if configured
-multiproc_dir = os.environ.get("PROMETHEUS_MULTIPROC_DIR")
-if multiproc_dir:
-    multiprocess.MultiProcessCollector(metrics_registry)
-
-HTTP_REQUESTS_TOTAL = Counter(
-    "http_requests_total",
-    "Total number of HTTP requests processed.",
-    ["method", "endpoint", "status"],
-    registry=metrics_registry
-)
-
-HTTP_REQUEST_DURATION_SECONDS = Histogram(
-    "http_request_duration_seconds",
-    "Total duration of HTTP requests in seconds.",
-    ["method", "endpoint"],
-    registry=metrics_registry
-)
+# --- Prometheus Metrics Registration (Placeholder, defined above) ---
 
 # --- Middleware ---
 @app.middleware("http")
@@ -213,19 +340,31 @@ async def get_metrics():
     return PlainTextResponse(data, media_type=CONTENT_TYPE_LATEST)
 
 @app.post("/compare", dependencies=[Depends(rate_limit_dependency)])
-async def compare_names(request: ComparisonRequest):
-    validate_input(request.name1, "First Name / Place")
-    validate_input(request.name2, "Second Name / Place")
+async def compare_names(request_data: ComparisonRequest, request: Request):
+    validate_input(request_data.name1, "First Name / Place")
+    validate_input(request_data.name2, "Second Name / Place")
     
     start_time = time.perf_counter()
     try:
-        result = await run_in_threadpool(
-            engine.compare,
-            request.name1,
-            request.name2,
-            request.enable_aliases,
-            request.threshold
-        )
+        loop = asyncio.get_running_loop()
+        executor = getattr(request.app.state, "executor", None)
+        if executor:
+            result = await loop.run_in_executor(
+                executor,
+                engine.compare,
+                request_data.name1,
+                request_data.name2,
+                request_data.enable_aliases,
+                request_data.threshold
+            )
+        else:
+            result = await run_in_threadpool(
+                engine.compare,
+                request_data.name1,
+                request_data.name2,
+                request_data.enable_aliases,
+                request_data.threshold
+            )
         duration_ms = (time.perf_counter() - start_time) * 1000
         result["processing_time_ms"] = round(duration_ms, 3)
         return result
@@ -235,7 +374,7 @@ async def compare_names(request: ComparisonRequest):
         logger.error(f"Error during comparison: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error during processing")
 
-async def process_pair(pair: ComparisonRequest, global_enable_aliases: bool, global_threshold: float, index: int):
+async def process_pair(pair: ComparisonRequest, global_enable_aliases: bool, global_threshold: float, index: int, executor):
     """Worker helper to validate and run comparisons in a threadpool concurrently."""
     try:
         # Validate input values (sanitized)
@@ -246,35 +385,69 @@ async def process_pair(pair: ComparisonRequest, global_enable_aliases: bool, glo
         aliases_flag = pair.enable_aliases if pair.enable_aliases is not None else global_enable_aliases
         threshold_val = pair.threshold if pair.threshold is not None else global_threshold
         
-        res = await run_in_threadpool(
-            engine.compare,
-            pair.name1,
-            pair.name2,
-            aliases_flag,
-            threshold_val
-        )
+        loop = asyncio.get_running_loop()
+        if executor:
+            res = await loop.run_in_executor(
+                executor,
+                engine.compare,
+                pair.name1,
+                pair.name2,
+                aliases_flag,
+                threshold_val
+            )
+        else:
+            res = await run_in_threadpool(
+                engine.compare,
+                pair.name1,
+                pair.name2,
+                aliases_flag,
+                threshold_val
+            )
         return {"status": "success", "data": res}
     except HTTPException as e:
         return {"status": "error", "error": e.detail}
     except Exception as e:
         return {"status": "error", "error": "Internal error during batch processing"}
 
+from fastapi import Response
+
 @app.post("/compare-batch", dependencies=[Depends(rate_limit_dependency)])
-async def compare_batch(request: BatchRequest):
-    if not request.pairs:
+async def compare_batch(batch_request: BatchRequest, request: Request, response: Response):
+    if not batch_request.pairs:
         raise HTTPException(status_code=400, detail="Batch request must contain at least one comparison pair.")
+
+    # Enforce payload limit
+    if len(batch_request.pairs) > 1000:
+        raise HTTPException(status_code=400, detail="Batch request size cannot exceed 1000 pairs.")
 
     start_time = time.perf_counter()
     
-    # Offload CPU-bound batch computation tasks concurrently to avoid blocking
-    tasks = [
-        process_pair(pair, request.enable_aliases, request.threshold, i)
-        for i, pair in enumerate(request.pairs)
-    ]
-    results = await asyncio.gather(*tasks)
+    # Process tasks in chunks of 50 to yield control to the event loop
+    results = []
+    chunk_size = 50
+    executor = getattr(request.app.state, "executor", None)
     
+    for i in range(0, len(batch_request.pairs), chunk_size):
+        chunk = batch_request.pairs[i : i + chunk_size]
+        chunk_tasks = [
+            process_pair(pair, batch_request.enable_aliases, batch_request.threshold, i + j, executor)
+            for j, pair in enumerate(chunk)
+        ]
+        chunk_results = await asyncio.gather(*chunk_tasks)
+        results.extend(chunk_results)
+    
+    # Check for mixed errors and return 207 Multi-Status
+    has_success = any(r["status"] == "success" for r in results)
+    has_error = any(r["status"] == "error" for r in results)
+    
+    if has_error:
+        if not has_success:
+            response.status_code = 400
+        else:
+            response.status_code = 207  # Mixed success/failure
+            
     duration_ms = (time.perf_counter() - start_time) * 1000
-    logger.info(f"Batch of {len(request.pairs)} comparisons completed concurrently in {duration_ms:.2f}ms")
+    logger.info(f"Batch of {len(batch_request.pairs)} comparisons completed in {duration_ms:.2f}ms")
     return {
         "results": results,
         "processing_time_ms": round(duration_ms, 3)

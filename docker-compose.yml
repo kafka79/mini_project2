@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - ALLOWED_ORIGINS=*
+      - DEV_MODE=false
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - redis
+    volumes:
+      - ./backend:/app/backend
+      - ./frontend:/app/frontend
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"

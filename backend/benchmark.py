@@ -22,6 +22,8 @@ BENCHMARK_DATA = [
     ("Vikram", "Bikram", True, "B/V/W sound interchange"),
     ("Mukherjee", "Mookherjee", True, "Syllable spelling variation"),
     ("Lakshmi", "Laxmi", True, "Sanskrit conjunct spelling variant"),
+    ("Sanjay", "Sunjay", True, "Vowel shift variation (A vs U)"),
+    ("Geeta", "Gita", True, "Common vowel spelling shift (EE vs I)"),
     ("Chandra", "Sander", False, "Spelling difference with distinct phonetic codes"),
     
     # Distinct Entities (Should NOT match)

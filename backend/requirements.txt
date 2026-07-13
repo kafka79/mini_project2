@@ -5,3 +5,4 @@ rapidfuzz==3.6.2
 python-multipart==0.0.9
 prometheus-client==0.20.0
 pytest-asyncio==0.23.5
+redis==5.0.3
