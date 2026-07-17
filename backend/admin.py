@@ -50,11 +50,11 @@ async def add_alias_group(group: List[str], api_key: str = Depends(verify_admin_
         
     # Write into Redis Sets directly
     async with redis_client.pipeline(transaction=True) as pipe:
-        for member in full_group:
-            pipe.sadd(f"alias:{member}", *list(full_group - {member}))
+        for member in normalized_group:
+            pipe.sadd(f"alias:{member}", *list(normalized_group - {member}))
         await pipe.execute()
         
-    return {"status": "success", "message": f"Added/merged alias group: {list(full_group)}"}
+    return {"status": "success", "message": f"Added/merged alias group: {list(normalized_group)}"}
 
 class WeightsUpdate(BaseModel):
     default_threshold: float = Field(None, ge=0.0, le=100.0)
@@ -98,3 +98,29 @@ async def update_weights(payload: WeightsUpdate, api_key: str = Depends(verify_a
     await redis_client.set("weights", json.dumps(updates))
     await safe_publish_update()
     return {"status": "success", "message": "Weights updated successfully.", "current_weights": updates}
+
+@router.post("/aliases/reload")
+async def reload_aliases(api_key: str = Depends(verify_admin_key)):
+    """Reloads the aliases.json configurations without restarting the server."""
+    aliases_path = os.path.join(os.path.dirname(__file__), "aliases.json")
+    if not os.path.exists(aliases_path):
+        raise HTTPException(status_code=404, detail="aliases.json not found.")
+    
+    try:
+        with open(aliases_path, "r", encoding="utf-8") as f:
+            aliases_map = json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to parse aliases.json: {e}")
+        
+    loaded_groups = 0
+    async with redis_client.pipeline(transaction=True) as pipe:
+        for key, synonyms in aliases_map.items():
+            group = [key] + synonyms
+            normalized_group = {engine.normalize(x).lower() for x in group if engine.normalize(x).strip()}
+            if len(normalized_group) >= 2:
+                for member in normalized_group:
+                    pipe.sadd(f"alias:{member}", *list(normalized_group - {member}))
+                loaded_groups += 1
+        await pipe.execute()
+        
+    return {"status": "success", "message": f"Successfully reloaded {loaded_groups} alias groups from aliases.json"}

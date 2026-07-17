@@ -99,10 +99,10 @@ class TokenBucketLimiter:
         self.limit = limit
         self.window = window
         self.buckets = {}  # ip -> (tokens, last_update)
-        self.locks = defaultdict(threading.Lock)
+        self.lock = threading.Lock()
 
     def is_allowed(self, ip: str) -> bool:
-        with self.locks[ip]:
+        with self.lock:
             now = time.time()
             if ip not in self.buckets:
                 self.buckets[ip] = (self.limit - 1, now)
@@ -133,7 +133,7 @@ class RedisRateLimiter:
         
         if not self.breaker.is_allowed():
             RATE_LIMITER_BYPASSED_TOTAL.inc()
-            return False # Fail closed securely
+            return self.fallback_limiter.is_allowed(client_ip)
             
         try:
             async with redis_client.pipeline(transaction=True) as pipe:
@@ -151,7 +151,7 @@ class RedisRateLimiter:
             self.breaker.record_failure()
             REDIS_CONNECTION_ERRORS_TOTAL.inc()
             RATE_LIMITER_BYPASSED_TOTAL.inc()
-            return False # Fail closed securely
+            return self.fallback_limiter.is_allowed(client_ip)
 
 # Limit to 100 requests per 60 seconds per IP
 rate_limiter = RedisRateLimiter(limit=100, window=60)
@@ -277,10 +277,13 @@ else:
     origins = []
     logger.warning("CORS: ALLOWED_ORIGINS not set. CORS requests will be blocked.")
 
+# FASTAPI/Starlette strictly forbids wildcard origins with credentials enabled
+credentials = True if origins and "*" not in origins else False
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
-    allow_credentials=True if origins else False,
+    allow_credentials=credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -366,26 +369,9 @@ async def compare_names(request_data: ComparisonRequest, request: Request):
         logger.error(f"Error during comparison: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error during processing")
 
-async def process_pair(pair: ComparisonRequest, global_enable_aliases: bool, global_threshold: float, global_locale: str, index: int):
+async def process_pair_cpu(pair: ComparisonRequest, aliases_flag: bool, threshold_val: float, locale_val: str, index: int, is_alias_match: bool):
     """Worker helper to validate and run comparisons in a threadpool concurrently."""
     try:
-        validate_input(pair.name1, f"Pair {index+1} Name 1")
-        validate_input(pair.name2, f"Pair {index+1} Name 2")
-        
-        aliases_flag = pair.enable_aliases if pair.enable_aliases is not None else global_enable_aliases
-        threshold_val = pair.threshold if pair.threshold is not None else global_threshold
-        locale_val = pair.locale if pair.locale is not None else global_locale
-        
-        is_alias_match = False
-        if aliases_flag:
-            norm1 = engine.normalize(pair.name1, locale=locale_val).lower()
-            norm2 = engine.normalize(pair.name2, locale=locale_val).lower()
-            try:
-                if await redis_client.sismember(f"alias:{norm1}", norm2):
-                    is_alias_match = True
-            except Exception as e:
-                logger.warning(f"Failed to check Redis aliases: {e}")
-
         res = await run_in_threadpool(
             engine.compare,
             pair.name1,
@@ -418,13 +404,58 @@ async def compare_batch(batch_request: BatchRequest, request: Request):
     
     for i in range(0, len(batch_request.pairs), chunk_size):
         chunk = batch_request.pairs[i : i + chunk_size]
+        
+        # 1. Resolve parameters and collect validations
+        valid_chunk = []
+        alias_checks = []
+        
+        for j, pair in enumerate(chunk):
+            index = i + j
+            try:
+                validate_input(pair.name1, f"Pair {index+1} Name 1")
+                validate_input(pair.name2, f"Pair {index+1} Name 2")
+                
+                aliases_flag = pair.enable_aliases if pair.enable_aliases is not None else batch_request.enable_aliases
+                threshold_val = pair.threshold if pair.threshold is not None else batch_request.threshold
+                locale_val = pair.locale if pair.locale is not None else batch_request.locale
+                
+                if aliases_flag:
+                    norm1 = engine.normalize(pair.name1, locale=locale_val).lower()
+                    norm2 = engine.normalize(pair.name2, locale=locale_val).lower()
+                    alias_checks.append((norm1, norm2, index, pair, aliases_flag, threshold_val, locale_val))
+                else:
+                    valid_chunk.append((pair, aliases_flag, threshold_val, locale_val, index, False))
+            except HTTPException as e:
+                results.append({"status": "error", "error": e.detail})
+            except Exception:
+                results.append({"status": "error", "error": "Internal error during validation"})
+
+        # 2. Pipelined Redis alias lookup
+        alias_results = []
+        if alias_checks:
+            try:
+                async with redis_client.pipeline(transaction=False) as pipe:
+                    for norm1, norm2, _, _, _, _, _ in alias_checks:
+                        pipe.sismember(f"alias:{norm1}", norm2)
+                    alias_results = await pipe.execute()
+            except Exception as e:
+                logger.warning(f"Batch Redis alias check failed: {e}")
+                alias_results = [False] * len(alias_checks)
+                
+            for idx, (norm1, norm2, index, pair, aliases_flag, threshold_val, locale_val) in enumerate(alias_checks):
+                is_alias_match = bool(alias_results[idx])
+                valid_chunk.append((pair, aliases_flag, threshold_val, locale_val, index, is_alias_match))
+                
+        # 3. CPU bound processing
         chunk_tasks = [
-            process_pair(pair, batch_request.enable_aliases, batch_request.threshold, batch_request.locale, i + j)
-            for j, pair in enumerate(chunk)
+            process_pair_cpu(pair, aliases_flag, threshold_val, locale_val, index, is_alias_match)
+            for pair, aliases_flag, threshold_val, locale_val, index, is_alias_match in valid_chunk
         ]
-        chunk_results = await asyncio.gather(*chunk_tasks)
-        await asyncio.sleep(0)  # Yield to the event loop
-        results.extend(chunk_results)
+        
+        if chunk_tasks:
+            chunk_results = await asyncio.gather(*chunk_tasks)
+            results.extend(chunk_results)
+            await asyncio.sleep(0)  # Yield to the event loop
     
     errors = [r for r in results if r["status"] == "error"]
     successes = [r for r in results if r["status"] == "success"]

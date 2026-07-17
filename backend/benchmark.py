@@ -1,6 +1,24 @@
 import time
 import numpy as np
+import json
+import os
 from phonetic_engine import engine
+
+# Load local aliases to calculate is_alias_match for benchmark comparison (mimicking Redis)
+aliases_map = {}
+aliases_path = os.path.join(os.path.dirname(__file__), "aliases.json")
+try:
+    with open(aliases_path, "r", encoding="utf-8") as f:
+        raw_aliases = json.load(f)
+        for k, v in raw_aliases.items():
+            group = [k] + v
+            normalized_group = {engine.normalize(x).lower() for x in group}
+            for member in normalized_group:
+                if member not in aliases_map:
+                    aliases_map[member] = set()
+                aliases_map[member].update(normalized_group - {member})
+except Exception:
+    pass
 
 # Labeled dataset of Indic name pairs for phonetic similarity verification
 # Format: (Name 1, Name 2, expected_is_similar, description)
@@ -50,17 +68,6 @@ def run_benchmarks():
     
     print(f"{'Name 1':<20} | {'Name 2':<20} | {'True':<5} | {'Pred':<5} | {'Score':<6} | {'Time (ms)':<9} | {'Status'}")
     print("-" * 90)
-    
-    # Load local aliases to calculate is_alias_match for benchmark comparison (mimicking Redis)
-    import json
-    import os
-    aliases_map = {}
-    aliases_path = os.path.join(os.path.dirname(__file__), "aliases.json")
-    try:
-        with open(aliases_path, "r", encoding="utf-8") as f:
-            aliases_map = json.load(f)
-    except Exception:
-        pass
 
     for name1, name2, expected, desc in BENCHMARK_DATA:
         start_time = time.perf_counter()

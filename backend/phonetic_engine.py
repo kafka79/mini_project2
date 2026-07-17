@@ -171,18 +171,21 @@ class IndicPhoneticEngine:
             c for c in unicodedata.normalize('NFD', text)
             if unicodedata.category(c) != 'Mn'
         )
+        
+        # Standardize double vowels for better fuzzy matching
+        text = text.replace("EE", "I").replace("OO", "U")
+        
         # Preserve alphanumeric characters and spaces
         text = re.sub(r'[^A-Z0-9\s]', ' ', text)
         text = re.sub(r'\s+', ' ', text)
         
         # Schwa Deletion / Terminal Vowel normalization:
-        # Schwa Deletion / Terminal Vowel normalization:
-        # Refined rule: Only strip terminal A if word length > 4 to preserve short names.
+        # Refined rule: Only strip terminal A if word length > 2 to preserve uniform short names.
         # Stop stripping O and U as they are strong phonetic identifiers.
         words = text.split()
         normalized_words = []
         for w in words:
-            if len(w) > 4 and w[-1] == 'A':
+            if len(w) > 2 and w[-1] == 'A':
                 normalized_words.append(w[:-1])
             else:
                 normalized_words.append(w)
@@ -294,11 +297,12 @@ class IndicPhoneticEngine:
                 code_sim = 0
                 
             if code_sim >= 80:  # Soft phonetic match for vowel shifts
-                boost = self.BOOST_LONG_WORD if min_len > 3 else self.BOOST_SHORT_WORD
-                min_score = self.MIN_LONG_WORD if min_len > 3 else self.MIN_SHORT_WORD
-                boost_multiplier = code_sim / 100.0
-                final_score = min(100.0, fuzzy_score + (boost * boost_multiplier))
-                final_score = max(final_score, min_score * boost_multiplier)
+                if code1[0] == code2[0]:
+                    boost = self.BOOST_LONG_WORD if min_len > 3 else self.BOOST_SHORT_WORD
+                    min_score = self.MIN_LONG_WORD if min_len > 3 else self.MIN_SHORT_WORD
+                    boost_multiplier = code_sim / 100.0
+                    final_score = min(100.0, fuzzy_score + (boost * boost_multiplier))
+                    final_score = max(final_score, min_score * boost_multiplier)
                 
         # Cap hybrid score to 99.0 to distinguish from exact matches or verified aliases
         if final_score > 99.0:
